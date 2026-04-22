@@ -1,0 +1,244 @@
+# Zero-Trust Lateral Movement Detection Rules
+# SIEM Correlation Rules for East-West Threat Detection
+# Implements NIST 800-53 SI-4, IR-4
+# Reference: ADR-005 Logging Architecture
+
+# ============================================================
+# Rule ZT-002: Lateral Movement Detection
+# Correlates: VPC flow logs + authentication logs
+# Severity: CRITICAL
+# Response SLA: 5-minute triage, CISO notification within 15 min
+# ============================================================
+
+groups:
+  - name: zero_trust_lateral_movement
+    interval: 30s
+    rules:
+
+      # --------------------------------------------------------
+      # ZT-002a: New east-west communication path detected
+      # Triggers when a workload communicates with a segment
+      # it has never contacted before (baseline: 30-day window)
+      # --------------------------------------------------------
+      - alert: NewEastWestCommunicationPath
+        expr: |
+          (
+            count by (src_security_group, dst_security_group) (
+              rate(vpc_flow_log_bytes_total{
+                direction="east-west",
+                action="accept"
+              }[5m]) > 0
+            )
+          )
+          unless
+          (
+            count by (src_security_group, dst_security_group) (
+              rate(vpc_flow_log_bytes_total{
+                direction="east-west",
+                action="accept"
+              }[30d] offset 5m) > 0
+            )
+          )
+        for: 2m
+        labels:
+          severity: critical
+          nist_control: "SI-4,SC-7"
+          rule_id: "ZT-002a"
+          category: lateral_movement
+          response_sla: "5m triage, 15m CISO notification"
+        annotations:
+          summary: "New east-west communication path: {{ $labels.src_security_group }} → {{ $labels.dst_security_group }}"
+          description: |
+            A workload in security group {{ $labels.src_security_group }} has
+            established communication with security group {{ $labels.dst_security_group }}
+            for the first time in the 30-day baseline window. This may indicate
+            lateral movement from a compromised workload.
+
+            Immediate actions:
+            1. Verify if this communication path is authorized (check change management)
+            2. Inspect source workload for signs of compromise
+            3. Check correlated authentication events (ZT-002b)
+            4. If unauthorized: isolate source workload, revoke credentials
+          runbook: "https://runbooks.internal/incident-response#lateral-movement"
+
+      # --------------------------------------------------------
+      # ZT-002b: Failed auth followed by successful east-west connection
+      # High-confidence lateral movement indicator
+      # --------------------------------------------------------
+      - alert: FailedAuthThenEastWestConnection
+        expr: |
+          (
+            increase(auth_failures_total{auth_type="service"}[10m]) > 3
+          )
+          and on (source_identity)
+          (
+            increase(vpc_flow_new_connections_total{direction="east-west"}[10m]) > 0
+          )
+        for: 1m
+        labels:
+          severity: critical
+          nist_control: "SI-4,AC-7,SC-7"
+          rule_id: "ZT-002b"
+          category: lateral_movement
+          response_sla: "5m triage, 15m CISO notification"
+        annotations:
+          summary: "Failed auth + new east-west connection: {{ $labels.source_identity }}"
+          description: |
+            Identity {{ $labels.source_identity }} had {{ $value }} failed
+            authentication attempts followed by a new east-west network connection.
+            This pattern is a high-confidence indicator of credential brute-forcing
+            followed by lateral movement.
+
+            Immediate actions:
+            1. Lock the identity immediately
+            2. Isolate the source workload
+            3. Trace all connections from this identity in last 1 hour
+            4. Check for privilege escalation events (ZT-003)
+
+  - name: zero_trust_privilege_escalation
+    interval: 30s
+    rules:
+
+      # --------------------------------------------------------
+      # ZT-003: Privilege escalation from unexpected source
+      # --------------------------------------------------------
+      - alert: UnexpectedPrivilegeEscalation
+        expr: |
+          (
+            increase(iam_role_assumption_total{
+              source_type!="automation",
+              role_level="admin"
+            }[5m]) > 0
+          )
+          unless on (source_identity)
+          (
+            iam_authorized_admin_sources
+          )
+        for: 0s  # Alert immediately — no wait period for privilege escalation
+        labels:
+          severity: critical
+          nist_control: "AC-6,AU-12"
+          rule_id: "ZT-003"
+          category: privilege_escalation
+          response_sla: "5m triage, 15m CISO notification"
+        annotations:
+          summary: "Admin role assumed from unauthorized source: {{ $labels.source_identity }}"
+          description: |
+            Identity {{ $labels.source_identity }} assumed admin role
+            {{ $labels.assumed_role }} from a source not in the authorized
+            admin sources list. This may indicate a compromised identity
+            attempting privilege escalation.
+
+  - name: zero_trust_data_exfiltration
+    interval: 60s
+    rules:
+
+      # --------------------------------------------------------
+      # ZT-004: Anomalous outbound data transfer
+      # --------------------------------------------------------
+      - alert: AnomalousDataTransfer
+        expr: |
+          (
+            rate(vpc_flow_log_bytes_total{
+              direction="north-south",
+              flow_direction="egress"
+            }[15m])
+          ) > 2 * (
+            avg_over_time(
+              rate(vpc_flow_log_bytes_total{
+                direction="north-south",
+                flow_direction="egress"
+              }[15m])[7d:15m]
+            )
+          )
+        for: 5m
+        labels:
+          severity: critical
+          nist_control: "SI-4,SC-7"
+          rule_id: "ZT-004"
+          category: data_exfiltration
+          response_sla: "5m triage, 15m CISO notification"
+        annotations:
+          summary: "Outbound data transfer >2x baseline: {{ $labels.security_group }}"
+          description: |
+            Egress data volume from {{ $labels.security_group }} exceeds
+            2x the 7-day rolling average. Correlate with data access logs
+            to determine if sensitive data is being exfiltrated.
+
+      # --------------------------------------------------------
+      # ZT-008: DNS tunneling detection
+      # --------------------------------------------------------
+      - alert: DNSTunnelingDetected
+        expr: |
+          (
+            rate(dns_queries_total{
+              query_type="TXT",
+              entropy="high"
+            }[5m]) > 100/60
+          )
+          or
+          (
+            count by (queried_domain) (
+              rate(dns_queries_total[5m]) > 0
+            )
+            and
+            avg by (queried_domain) (dns_query_subdomain_length) > 30
+          )
+        for: 2m
+        labels:
+          severity: high
+          nist_control: "SI-4,SC-7"
+          rule_id: "ZT-008"
+          category: data_exfiltration
+        annotations:
+          summary: "Possible DNS tunneling: {{ $labels.queried_domain }}"
+          description: |
+            High-entropy DNS queries detected to {{ $labels.queried_domain }}.
+            Pattern matches DNS tunneling: >100 queries/min with high-entropy
+            subdomains or unusually long subdomain labels.
+
+  - name: zero_trust_configuration_drift
+    interval: 300s  # Check every 5 minutes
+    rules:
+
+      # --------------------------------------------------------
+      # ZT-007: Security configuration drift
+      # --------------------------------------------------------
+      - alert: SecurityGroupModified
+        expr: |
+          increase(config_change_events_total{
+            resource_type="security_group",
+            change_source!="terraform"
+          }[10m]) > 0
+        for: 0s
+        labels:
+          severity: medium
+          nist_control: "CM-3,CM-6"
+          rule_id: "ZT-007a"
+          category: configuration_drift
+        annotations:
+          summary: "Security group modified outside IaC: {{ $labels.resource_id }}"
+          description: |
+            Security group {{ $labels.resource_id }} was modified by
+            {{ $labels.change_source }} (not via Terraform). Manual changes
+            to security groups bypass change management review and may
+            introduce unauthorized communication paths.
+
+      - alert: EncryptionConfigChanged
+        expr: |
+          increase(config_change_events_total{
+            resource_type=~"encryption|kms|certificate",
+            change_source!="terraform"
+          }[10m]) > 0
+        for: 0s
+        labels:
+          severity: high
+          nist_control: "SC-12,SC-13,CM-3"
+          rule_id: "ZT-007b"
+          category: configuration_drift
+        annotations:
+          summary: "Encryption configuration changed: {{ $labels.resource_id }}"
+          description: |
+            Encryption-related configuration {{ $labels.resource_id }} was
+            modified outside the IaC pipeline. This may weaken data protection
+            controls. Verify encryption settings match ADR-003 standards.

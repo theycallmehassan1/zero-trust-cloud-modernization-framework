@@ -1,0 +1,468 @@
+---
+# CIS Level 2 Benchmark Hardening for RHEL 8/9
+# Implements NIST 800-53: CM-6, SC-7, AU-2, AC-17
+# Reference: CIS Red Hat Enterprise Linux 8 Benchmark v3.0.0
+#
+# Usage: ansible-playbook harden-baseline.yml -i inventory/production
+# 
+# WARNING: This playbook makes security-critical changes. Test in staging first.
+# Some controls may impact application functionality — review each section.
+
+- name: Zero-Trust Baseline Hardening — CIS Level 2
+  hosts: all
+  become: true
+  vars:
+    cis_level: 2
+    audit_log_max_size: 8192        # MB, per NIST AU-4
+    audit_log_retention: 365        # Days
+    ssh_max_auth_tries: 3
+    ssh_client_alive_interval: 300  # 5 minutes
+    ssh_client_alive_count: 0       # Disconnect after one missed keepalive
+    password_max_days: 90
+    password_min_days: 7
+    password_min_length: 15
+    failed_login_lockout: 5
+    lockout_duration: 900           # 15 minutes
+    
+  handlers:
+    - name: restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+    - name: restart auditd
+      ansible.builtin.command: service auditd restart
+      # auditd requires service command, not systemctl
+
+    - name: reload sysctl
+      ansible.builtin.command: sysctl --system
+
+    - name: restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+
+  tasks:
+    # =================================================================
+    # Section 1: Initial Setup — Filesystem Configuration
+    # CIS 1.1.x: Filesystem hardening
+    # =================================================================
+
+    - name: "1.1.1 | Disable unused filesystems"
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/zt-disable-fs.conf
+        content: |
+          # Zero-Trust Hardening — Disable unnecessary filesystem modules
+          # CIS 1.1.1.x, NIST CM-7
+          install cramfs /bin/true
+          install freevxfs /bin/true
+          install jffs2 /bin/true
+          install hfs /bin/true
+          install hfsplus /bin/true
+          install squashfs /bin/true
+          install udf /bin/true
+          install vfat /bin/true
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [cis, filesystem]
+
+    - name: "1.1.8 | Ensure noexec on /tmp"
+      ansible.posix.mount:
+        name: /tmp
+        src: tmpfs
+        fstype: tmpfs
+        opts: "defaults,noexec,nosuid,nodev,size=2G"
+        state: mounted
+      tags: [cis, filesystem]
+
+    - name: "1.1.14 | Ensure nosuid on /dev/shm"
+      ansible.posix.mount:
+        name: /dev/shm
+        src: tmpfs
+        fstype: tmpfs
+        opts: "defaults,noexec,nosuid,nodev"
+        state: mounted
+      tags: [cis, filesystem]
+
+    # =================================================================
+    # Section 2: Services — Disable Unnecessary Services
+    # CIS 2.x: Minimize attack surface
+    # =================================================================
+
+    - name: "2.1 | Disable unnecessary services"
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - avahi-daemon
+        - cups
+        - dhcpd
+        - slapd
+        - nfs-server
+        - rpcbind
+        - named
+        - vsftpd
+        - httpd          # Use containerized web services instead
+        - dovecot
+        - smb
+        - squid
+        - snmpd
+        - telnet.socket
+        - rsh.socket
+        - rlogin.socket
+      ignore_errors: true  # Some services may not be installed
+      tags: [cis, services]
+
+    # =================================================================
+    # Section 3: Network Configuration
+    # CIS 3.x, NIST SC-7: Network hardening
+    # =================================================================
+
+    - name: "3.1 | Network hardening — sysctl parameters"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-zt-network-hardening.conf
+        content: |
+          # Zero-Trust Network Hardening
+          # CIS 3.1.x-3.3.x, NIST SC-7
+
+          # Disable IP forwarding (unless this is a router/firewall)
+          net.ipv4.ip_forward = 0
+          net.ipv6.conf.all.forwarding = 0
+
+          # Disable source routing
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.conf.default.accept_source_route = 0
+          net.ipv6.conf.all.accept_source_route = 0
+          net.ipv6.conf.default.accept_source_route = 0
+
+          # Disable ICMP redirects (prevent MitM)
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+
+          # Enable SYN cookies (prevent SYN flood)
+          net.ipv4.tcp_syncookies = 1
+
+          # Log martian packets (packets with impossible source addresses)
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+
+          # Ignore ICMP broadcast requests
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+          # Ignore bogus ICMP error responses
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+          # Enable reverse path filtering (anti-spoofing)
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+
+          # Disable IPv6 if not required
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+
+          # TCP hardening
+          net.ipv4.tcp_max_syn_backlog = 2048
+          net.ipv4.tcp_synack_retries = 2
+          net.ipv4.tcp_syn_retries = 5
+        owner: root
+        group: root
+        mode: '0644'
+      notify: reload sysctl
+      tags: [cis, network]
+
+    # =================================================================
+    # Section 4: Audit Configuration
+    # CIS 4.x, NIST AU-2, AU-3, AU-12: Comprehensive audit logging
+    # =================================================================
+
+    - name: "4.1 | Ensure auditd is installed and enabled"
+      ansible.builtin.package:
+        name:
+          - audit
+          - audit-libs
+        state: present
+      tags: [cis, audit]
+
+    - name: "4.1.1 | Enable auditd service"
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true
+      tags: [cis, audit]
+
+    - name: "4.1.2 | Configure audit rules for zero-trust monitoring"
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/zt-audit.rules
+        content: |
+          # Zero-Trust Audit Rules
+          # NIST 800-53: AU-2, AU-3, AU-12
+          # Maps to SIEM correlation rules ZT-001 through ZT-008
+
+          # Ensure audit log is not manually deleted
+          -e 2
+
+          # Buffer size for high-volume environments
+          -b 8192
+
+          # Monitor authentication events (ZT-001: impossible travel detection)
+          -w /var/log/faillog -p wa -k zt-authentication
+          -w /var/log/lastlog -p wa -k zt-authentication
+          -w /var/log/tallylog -p wa -k zt-authentication
+
+          # Monitor identity and access changes (ZT-003: privilege escalation)
+          -w /etc/passwd -p wa -k zt-identity-change
+          -w /etc/shadow -p wa -k zt-identity-change
+          -w /etc/group -p wa -k zt-identity-change
+          -w /etc/gshadow -p wa -k zt-identity-change
+          -w /etc/sudoers -p wa -k zt-privilege-escalation
+          -w /etc/sudoers.d/ -p wa -k zt-privilege-escalation
+
+          # Monitor privileged commands (ZT-003)
+          -a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=4294967295 -k zt-privileged-cmd
+          -a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=4294967295 -k zt-privileged-cmd
+          -a always,exit -F path=/usr/bin/chage -F perm=x -F auid>=1000 -F auid!=4294967295 -k zt-privileged-cmd
+          -a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=4294967295 -k zt-privileged-cmd
+
+          # Monitor network configuration changes (ZT-007: config drift)
+          -w /etc/sysconfig/network -p wa -k zt-network-config
+          -w /etc/sysconfig/network-scripts/ -p wa -k zt-network-config
+          -w /etc/hosts -p wa -k zt-network-config
+          -w /etc/resolv.conf -p wa -k zt-network-config
+          -a always,exit -F arch=b64 -S sethostname -S setdomainname -k zt-network-config
+
+          # Monitor file access for sensitive data (ZT-004: data exfiltration)
+          -w /etc/ssh/sshd_config -p wa -k zt-ssh-config
+          -w /etc/pam.d/ -p wa -k zt-pam-config
+          -w /etc/security/ -p wa -k zt-security-config
+
+          # Monitor kernel module loading (supply chain / rootkit detection)
+          -w /sbin/insmod -p x -k zt-kernel-module
+          -w /sbin/rmmod -p x -k zt-kernel-module
+          -w /sbin/modprobe -p x -k zt-kernel-module
+          -a always,exit -F arch=b64 -S init_module -S delete_module -k zt-kernel-module
+
+          # Monitor mount operations
+          -a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=4294967295 -k zt-mount
+
+          # Monitor time changes (forensic integrity)
+          -a always,exit -F arch=b64 -S adjtimex -S settimeofday -k zt-time-change
+          -w /etc/localtime -p wa -k zt-time-change
+
+          # Monitor cron changes (persistence detection)
+          -w /etc/crontab -p wa -k zt-cron
+          -w /etc/cron.d/ -p wa -k zt-cron
+          -w /etc/cron.daily/ -p wa -k zt-cron
+          -w /etc/cron.hourly/ -p wa -k zt-cron
+          -w /var/spool/cron/ -p wa -k zt-cron
+        owner: root
+        group: root
+        mode: '0640'
+      notify: restart auditd
+      tags: [cis, audit]
+
+    - name: "4.1.3 | Configure audit log rotation and retention"
+      ansible.builtin.lineinfile:
+        path: /etc/audit/auditd.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^max_log_file\s', line: "max_log_file = {{ audit_log_max_size }}" }
+        - { regexp: '^max_log_file_action', line: 'max_log_file_action = keep_logs' }
+        - { regexp: '^space_left_action', line: 'space_left_action = email' }
+        - { regexp: '^admin_space_left_action', line: 'admin_space_left_action = halt' }
+        - { regexp: '^action_mail_acct', line: 'action_mail_acct = root' }
+      notify: restart auditd
+      tags: [cis, audit]
+
+    # =================================================================
+    # Section 5: SSH Hardening
+    # CIS 5.2.x, NIST AC-17, IA-2: Secure remote access
+    # =================================================================
+
+    - name: "5.2 | SSH hardening configuration"
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/zt-hardening.conf
+        content: |
+          # Zero-Trust SSH Hardening
+          # CIS 5.2.x, NIST AC-17, IA-2
+          
+          # Protocol 2 only (CIS 5.2.2)
+          Protocol 2
+          
+          # Disable root login (CIS 5.2.10)
+          PermitRootLogin no
+          
+          # Key-based authentication only (CIS 5.2.4)
+          PasswordAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+          
+          # Disable unused authentication methods
+          HostbasedAuthentication no
+          PermitEmptyPasswords no
+          KerberosAuthentication no
+          GSSAPIAuthentication no
+          
+          # Session limits (CIS 5.2.16, 5.2.17)
+          MaxAuthTries {{ ssh_max_auth_tries }}
+          MaxSessions 4
+          ClientAliveInterval {{ ssh_client_alive_interval }}
+          ClientAliveCountMax {{ ssh_client_alive_count }}
+          LoginGraceTime 60
+          
+          # Restrict ciphers to FIPS-approved (NIST SC-13)
+          Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+          MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+          KexAlgorithms ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group16-sha512
+          
+          # Logging (NIST AU-2)
+          LogLevel VERBOSE
+          
+          # Restrict access
+          AllowTcpForwarding no
+          X11Forwarding no
+          PermitTunnel no
+          
+          # Display banner (NIST AC-8)
+          Banner /etc/issue.net
+        owner: root
+        group: root
+        mode: '0600'
+      notify: restart sshd
+      tags: [cis, ssh]
+
+    - name: "5.2.1 | Set SSH warning banner"
+      ansible.builtin.copy:
+        dest: /etc/issue.net
+        content: |
+          ***************************************************************************
+          WARNING: This system is for authorized use only.
+          
+          All activities on this system are monitored and recorded. Unauthorized
+          access or use of this system may subject you to criminal prosecution
+          and penalties. By accessing this system, you consent to monitoring.
+          
+          NIST SP 800-53 AC-8 | System Use Notification
+          ***************************************************************************
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [cis, ssh]
+
+    # =================================================================
+    # Section 6: Account Lockout and Password Policy
+    # CIS 5.3-5.5, NIST IA-5: Authentication hardening
+    # =================================================================
+
+    - name: "5.3 | Configure account lockout (pam_faillock)"
+      ansible.builtin.copy:
+        dest: /etc/security/faillock.conf
+        content: |
+          # Zero-Trust Account Lockout Configuration
+          # CIS 5.3.2, NIST AC-7
+          deny = {{ failed_login_lockout }}
+          unlock_time = {{ lockout_duration }}
+          fail_interval = 900
+          audit
+          even_deny_root
+          root_unlock_time = {{ lockout_duration * 2 }}
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [cis, authentication]
+
+    - name: "5.4 | Configure password quality (pwquality)"
+      ansible.builtin.copy:
+        dest: /etc/security/pwquality.conf
+        content: |
+          # Zero-Trust Password Quality Requirements
+          # CIS 5.4.1, NIST IA-5
+          minlen = {{ password_min_length }}
+          dcredit = -1
+          ucredit = -1
+          ocredit = -1
+          lcredit = -1
+          minclass = 4
+          maxrepeat = 3
+          maxclassrepeat = 4
+          dictcheck = 1
+          enforcing = 1
+        owner: root
+        group: root
+        mode: '0644'
+      tags: [cis, authentication]
+
+    # =================================================================
+    # Section 7: File Permissions and Integrity
+    # CIS 6.x, NIST SI-7: System integrity
+    # =================================================================
+
+    - name: "6.1 | Set permissions on critical files"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: root
+        group: "{{ item.group | default('root') }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/passwd, mode: '0644' }
+        - { path: /etc/shadow, mode: '0000', group: 'root' }
+        - { path: /etc/group, mode: '0644' }
+        - { path: /etc/gshadow, mode: '0000', group: 'root' }
+        - { path: /etc/passwd-, mode: '0644' }
+        - { path: /etc/shadow-, mode: '0000', group: 'root' }
+        - { path: /etc/group-, mode: '0644' }
+        - { path: /etc/gshadow-, mode: '0000', group: 'root' }
+        - { path: /boot/grub2/grub.cfg, mode: '0600' }
+      ignore_errors: true
+      tags: [cis, permissions]
+
+    - name: "6.2 | Install and configure AIDE (file integrity monitoring)"
+      ansible.builtin.package:
+        name: aide
+        state: present
+      tags: [cis, integrity]
+
+    - name: "6.2.1 | Initialize AIDE database"
+      ansible.builtin.command: aide --init
+      args:
+        creates: /var/lib/aide/aide.db.new.gz
+      tags: [cis, integrity]
+
+    - name: "6.2.2 | Configure AIDE cron job"
+      ansible.builtin.cron:
+        name: "AIDE integrity check"
+        minute: "0"
+        hour: "5"
+        job: "/usr/sbin/aide --check | /usr/bin/mail -s 'AIDE Report - {{ inventory_hostname }}' security@agency.gov"
+        user: root
+      tags: [cis, integrity]
+
+    # =================================================================
+    # Post-hardening validation
+    # =================================================================
+
+    - name: "POST | Verify hardening was applied"
+      ansible.builtin.shell: |
+        echo "=== Zero-Trust Hardening Validation ==="
+        echo "SSH Protocol: $(grep -c 'Protocol 2' /etc/ssh/sshd_config.d/zt-hardening.conf) (expect 1)"
+        echo "Root login disabled: $(grep -c 'PermitRootLogin no' /etc/ssh/sshd_config.d/zt-hardening.conf) (expect 1)"
+        echo "Password auth disabled: $(grep -c 'PasswordAuthentication no' /etc/ssh/sshd_config.d/zt-hardening.conf) (expect 1)"
+        echo "IP forwarding disabled: $(sysctl net.ipv4.ip_forward | grep -c '= 0') (expect 1)"
+        echo "SYN cookies enabled: $(sysctl net.ipv4.tcp_syncookies | grep -c '= 1') (expect 1)"
+        echo "Auditd running: $(systemctl is-active auditd)"
+        echo "Audit rules loaded: $(auditctl -l | wc -l) rules"
+        echo "=== Validation Complete ==="
+      register: validation_output
+      changed_when: false
+      tags: [cis, validation]
+
+    - name: "POST | Display validation results"
+      ansible.builtin.debug:
+        var: validation_output.stdout_lines
+      tags: [cis, validation]
